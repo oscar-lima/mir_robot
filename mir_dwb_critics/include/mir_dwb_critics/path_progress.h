@@ -37,11 +37,7 @@
 #include <dwb_critics/map_grid.h>
 #include <ros/publisher.h>
 #include <vector>
-
-namespace geometry_msgs
-{
-struct PoseStamped;
-}
+#include <geometry_msgs/PoseStamped.h>
 
 namespace mir_dwb_critics
 {
