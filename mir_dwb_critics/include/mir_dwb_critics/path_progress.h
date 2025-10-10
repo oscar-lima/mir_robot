@@ -35,7 +35,13 @@
 #define MIR_DWB_CRITICS_PATH_PROGRESS_H_
 
 #include <dwb_critics/map_grid.h>
+#include <ros/publisher.h>
 #include <vector>
+
+namespace geometry_msgs
+{
+struct PoseStamped;
+}
 
 namespace mir_dwb_critics
 {
@@ -82,6 +88,7 @@ protected:
 
   std::vector<geometry_msgs::Pose2D> reached_intermediate_goals_;
   double desired_angle_;
+  ros::Publisher intermediate_goal_pub_;
 };
 
 }  // namespace mir_dwb_critics

@@ -33,9 +33,12 @@
  */
 #include <mir_dwb_critics/path_progress.h>
 #include <angles/angles.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <nav_grid/coordinate_conversion.h>
 #include <pluginlib/class_list_macros.h>
 #include <nav_2d_utils/path_ops.h>
+#include <ros/time.h>
+#include <tf2/LinearMath/Quaternion.h>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -72,6 +75,8 @@ void PathProgressCritic::onInit()
   critic_nh_.param("articulation_angle_threshold", articulation_angle_threshold_, 1.3089969389957472);
   critic_nh_.param("heading_scale", heading_scale_, 1.0);
   critic_nh_.param("enforce_forward_dot", enforce_forward_dot_, true);
+
+  intermediate_goal_pub_ = critic_nh_.advertise<geometry_msgs::PoseStamped>("intermediate_goal", 1);
 
   articulation_angle_threshold_ = std::max(articulation_angle_threshold_, angle_threshold_);
 
@@ -299,6 +304,23 @@ bool PathProgressCritic::getGoalPose(const geometry_msgs::Pose2D& robot_pose, co
   ROS_DEBUG_NAMED("PathProgressCritic",
                   "Selected goal index %u (x: %.3f, y: %.3f, yaw: %.3f rad). last_progress_index_: %u",
                   goal_index, plan[goal_index].x, plan[goal_index].y, goal_yaw, last_progress_index_);
+
+  if (intermediate_goal_pub_)
+  {
+    geometry_msgs::PoseStamped goal_pose;
+    goal_pose.header = global_plan.header;
+    goal_pose.header.stamp = ros::Time::now();
+    goal_pose.pose.position.x = plan[goal_index].x;
+    goal_pose.pose.position.y = plan[goal_index].y;
+    goal_pose.pose.position.z = 0.0;
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, goal_yaw);
+    goal_pose.pose.orientation.x = q.x();
+    goal_pose.pose.orientation.y = q.y();
+    goal_pose.pose.orientation.z = q.z();
+    goal_pose.pose.orientation.w = q.w();
+    intermediate_goal_pub_.publish(goal_pose);
+  }
   return true;
 }
 
