@@ -177,10 +177,6 @@ bool PathProgressCritic::getGoalPose(const geometry_msgs::Pose2D& robot_pose, co
 
   // Constrain the search range to enforce monotonic progress.
   last_progress_index_ = std::min(last_progress_index_, static_cast<unsigned int>(plan.size() - 1));
-  if (last_progress_index_ > last_valid_index)
-  {
-    last_progress_index_ = last_valid_index;
-  }
 
   unsigned int search_start_index = std::max(start_index, last_progress_index_);
   search_start_index = std::min(search_start_index, last_valid_index);
@@ -255,11 +251,43 @@ bool PathProgressCritic::getGoalPose(const geometry_msgs::Pose2D& robot_pose, co
 
   if (!found_goal)
   {
-    goal_index = std::min(last_valid_index, search_start_index);
-    has_forward_direction = computeOutgoingAngle(plan, goal_index, goal_yaw);
-    if (!has_forward_direction)
+    unsigned int fallback_start = std::min(last_valid_index, search_start_index);
+    goal_index = fallback_start;
+    bool selected_fallback = false;
+
+    for (; goal_index <= last_valid_index; ++goal_index)
     {
+      has_forward_direction = computeOutgoingAngle(plan, goal_index, goal_yaw);
+      if (has_forward_direction)
+      {
+        if (!enforce_forward_dot_)
+        {
+          selected_fallback = true;
+          break;
+        }
+
+        double to_goal_x = plan[goal_index].x - robot_pose.x;
+        double to_goal_y = plan[goal_index].y - robot_pose.y;
+        double dot = to_goal_x * std::cos(goal_yaw) + to_goal_y * std::sin(goal_yaw);
+        if (dot >= 0.0)
+        {
+          selected_fallback = true;
+          break;
+        }
+        continue;
+      }
+
       goal_yaw = plan[goal_index].theta;
+      if (!enforce_forward_dot_ || goal_index == last_valid_index)
+      {
+        selected_fallback = true;
+        break;
+      }
+    }
+
+    if (!selected_fallback)
+    {
+      return false;
     }
   }
 
@@ -330,7 +358,7 @@ unsigned int PathProgressCritic::getGoalIndex(const std::vector<geometry_msgs::P
 
     if (previous_segment_angle_set)
     {
-      double articulation_angle = fabs(remainder(current_angle - previous_segment_angle, 2 * M_PI));
+      double articulation_angle = fabs(angles::shortest_angular_distance(previous_segment_angle, current_angle));
       if (articulation_angle >= articulation_angle_threshold_)
       {
         goal_index = previous_segment_end_index;
@@ -338,7 +366,7 @@ unsigned int PathProgressCritic::getGoalIndex(const std::vector<geometry_msgs::P
       }
     }
 
-    double deviation = fabs(remainder(current_angle - base_angle, 2 * M_PI));
+    double deviation = fabs(angles::shortest_angular_distance(base_angle, current_angle));
     if (deviation > angle_threshold_)
     {
       break;
