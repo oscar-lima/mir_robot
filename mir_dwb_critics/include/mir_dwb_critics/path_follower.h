@@ -31,16 +31,20 @@
  *  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  *  POSSIBILITY OF SUCH DAMAGE.
  */
-#ifndef MIR_DWB_CRITICS_PATH_PROGRESS_H_
-#define MIR_DWB_CRITICS_PATH_PROGRESS_H_
+#ifndef MIR_DWB_CRITICS_PATH_FOLLOWER_H_
+#define MIR_DWB_CRITICS_PATH_FOLLOWER_H_
 
 #include <dwb_critics/map_grid.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <sensor_msgs/PointCloud.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <ros/publisher.h>
 #include <vector>
 
 namespace mir_dwb_critics
 {
 /**
- * @class PathProgressCritic
+ * @class PathFollowerCritic
  * @brief Calculates an intermediate goal along the global path and scores trajectories on the distance to that goal.
  *
  * This trajectory critic helps ensure progress along the global path. It
@@ -48,7 +52,7 @@ namespace mir_dwb_critics
  * path as long as the path continues to move in one direction (+/-
  * angle_threshold).
  */
-class PathProgressCritic : public dwb_critics::MapGridCritic
+class PathFollowerCritic : public dwb_critics::MapGridCritic
 {
 public:
   bool prepare(const geometry_msgs::Pose2D& pose, const nav_2d_msgs::Twist2D& vel, const geometry_msgs::Pose2D& goal,
@@ -63,15 +67,43 @@ protected:
                    unsigned int& y, double& desired_angle);
 
   unsigned int getGoalIndex(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int start_index,
-                            unsigned int last_valid_index) const;
+                            unsigned int last_valid_index, double& desired_angle, bool& has_forward_direction) const;
+
+  bool findNextArticulation(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int start_index,
+                            unsigned int end_index, unsigned int last_valid_index, unsigned int& articulation_index,
+                            double& articulation_yaw, bool& has_forward_direction) const;
+
+  bool computeOutgoingAngle(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int index,
+                            double& angle) const;
+
+  bool isGoalReached(const geometry_msgs::Pose2D& robot_pose, const geometry_msgs::Pose2D& goal_pose,
+                     double goal_yaw) const;
 
   double xy_local_goal_tolerance_;
+  double yaw_local_goal_tolerance_;
+  double final_goal_yaw_tolerance_;
+  double final_goal_xy_tolerance_;
   double angle_threshold_;
+  double articulation_angle_threshold_;
   double heading_scale_;
+  bool enforce_forward_dot_;
+  bool always_target_articulations_;
+  bool initial_alignment_done_;
+
+  unsigned int last_progress_index_;
+  bool holding_goal_;
+  unsigned int held_goal_index_;
+  geometry_msgs::Pose2D held_goal_pose_;
+  double hold_position_epsilon_;
+  double hold_yaw_epsilon_;
 
   std::vector<geometry_msgs::Pose2D> reached_intermediate_goals_;
   double desired_angle_;
+  ros::Publisher intermediate_goal_pub_;
+  ros::Publisher articulation_points_pub_;
+  ros::Publisher intermediate_goal_tolerance_pub_;
 };
 
 }  // namespace mir_dwb_critics
-#endif  // MIR_DWB_CRITICS_PATH_PROGRESS_H_
+#endif  // MIR_DWB_CRITICS_PATH_FOLLOWER_H_
+
