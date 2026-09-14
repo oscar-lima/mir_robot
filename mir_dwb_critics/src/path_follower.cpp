@@ -33,1316 +33,693 @@
  */
 #include <mir_dwb_critics/path_follower.h>
 #include <angles/angles.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_core2/exceptions.h>
 #include <nav_grid/coordinate_conversion.h>
 #include <pluginlib/class_list_macros.h>
-#include <nav_2d_utils/path_ops.h>
-#include <sensor_msgs/PointCloud.h>
-#include <visualization_msgs/MarkerArray.h>
 #include <ros/node_handle.h>
-#include <ros/time.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <utility>
 #include <vector>
 
 namespace mir_dwb_critics
 {
-bool PathFollowerCritic::prepare(const geometry_msgs::Pose2D& pose, const nav_2d_msgs::Twist2D& vel,
-                                 const geometry_msgs::Pose2D& goal, const nav_2d_msgs::Path2D& global_plan)
+namespace
 {
-  dwb_critics::MapGridCritic::reset();
+constexpr double kInfinity = std::numeric_limits<double>::infinity();
 
-  unsigned int local_goal_x, local_goal_y;
-  if (!getGoalPose(pose, goal, global_plan, local_goal_x, local_goal_y, desired_angle_))
-  {
-    return false;
-  }
-
-  // Enqueue just the last pose
-  cell_values_.setValue(local_goal_x, local_goal_y, 0.0);
-  queue_->enqueueCell(local_goal_x, local_goal_y);
-
-  propogateManhattanDistances();
-
-  return true;
+geometry_msgs::Pose2D makePose(double x, double y, double theta)
+{
+  geometry_msgs::Pose2D pose;
+  pose.x = x;
+  pose.y = y;
+  pose.theta = theta;
+  return pose;
 }
+}  // namespace
 
 void PathFollowerCritic::onInit()
 {
-  dwb_critics::MapGridCritic::onInit();
-  critic_nh_.param("xy_local_goal_tolerance", xy_local_goal_tolerance_, 0.20);
-  critic_nh_.param("yaw_local_goal_tolerance", yaw_local_goal_tolerance_, 0.15);
-  ros::NodeHandle private_nh("~");
-  if (!private_nh.getParam("yaw_goal_tolerance", final_goal_yaw_tolerance_))
-  {
-    critic_nh_.param("yaw_goal_tolerance", final_goal_yaw_tolerance_, yaw_local_goal_tolerance_);
-  }
-  if (!private_nh.getParam("xy_goal_tolerance", final_goal_xy_tolerance_))
-  {
-    critic_nh_.param("xy_goal_tolerance", final_goal_xy_tolerance_, xy_local_goal_tolerance_);
-  }
-  critic_nh_.param("angle_threshold", angle_threshold_, M_PI_4);
-  critic_nh_.param("articulation_angle_threshold", articulation_angle_threshold_, 1.3089969389957472);
-  critic_nh_.param("heading_scale", heading_scale_, 1.0);
-  critic_nh_.param("enforce_forward_dot", enforce_forward_dot_, true);
-  critic_nh_.param("always_target_articulations", always_target_articulations_, true);
-  int intermediate_goal_spacing_param = 0;
-  critic_nh_.param("intermediate_goal_spacing", intermediate_goal_spacing_param, 0);
-  if (intermediate_goal_spacing_param < 0)
-  {
-    ROS_WARN_NAMED("PathFollowerCritic",
-                   "Parameter intermediate_goal_spacing (%d) is negative. Clamping to 0 to disable spacing limit.",
-                   intermediate_goal_spacing_param);
-    intermediate_goal_spacing_param = 0;
-  }
-  intermediate_goal_spacing_ = static_cast<unsigned int>(intermediate_goal_spacing_param);
-  initial_alignment_done_ = false;
+  critic_nh_.param("xy_local_goal_tolerance", xy_local_goal_tolerance_, 0.05);
+  critic_nh_.param("xy_final_goal_tolerance", xy_final_goal_tolerance_, 0.02);
+  critic_nh_.param("yaw_local_goal_tolerance", yaw_local_goal_tolerance_, 0.1);
+  critic_nh_.param("stop_turn_angle", stop_turn_angle_, 0.5);
+  critic_nh_.param("start_turn_angle", start_turn_angle_, 0.2);
+
+  // Velocity profile limits default to the planner's kinematic configuration.
+  double max_vel_x = 0.8, max_vel_theta = 1.0, acc_lim_x = 1.5, acc_lim_theta = 2.0, decel_lim_x, decel_lim_theta;
+  planner_nh_.param("max_vel_x", max_vel_x, max_vel_x);
+  planner_nh_.param("max_vel_theta", max_vel_theta, max_vel_theta);
+  planner_nh_.param("acc_lim_x", acc_lim_x, acc_lim_x);
+  planner_nh_.param("acc_lim_theta", acc_lim_theta, acc_lim_theta);
+  planner_nh_.param("decel_lim_x", decel_lim_x, -acc_lim_x);
+  planner_nh_.param("decel_lim_theta", decel_lim_theta, -acc_lim_theta);
+  critic_nh_.param("max_speed", max_speed_, std::fabs(max_vel_x));
+  critic_nh_.param("max_rotation", max_rotation_, std::fabs(max_vel_theta));
+  // Braking at half the kinematic limit leaves margin for the proportional final approach.
+  critic_nh_.param("decel", decel_, 0.5 * std::fabs(decel_lim_x));
+  critic_nh_.param("rot_decel", rot_decel_, 0.5 * std::fabs(decel_lim_theta));
+  critic_nh_.param("approach_gain", approach_gain_, 3.0);
+  critic_nh_.param("rotation_gain", rotation_gain_, 4.0);
+  max_speed_ = std::max(max_speed_, 1e-3);
+  max_rotation_ = std::max(max_rotation_, 1e-3);
+
+  critic_nh_.param("speed_scale", speed_scale_, 64.0);
+  critic_nh_.param("rotation_scale", rotation_scale_, 64.0);
+  critic_nh_.param("heading_scale", heading_scale_, 25.0);
+  critic_nh_.param("path_distance_scale", path_distance_scale_, 4.0);
+  critic_nh_.param("search_window", search_window_, 1.0);
+  critic_nh_.param("corner_fillet_length", corner_fillet_length_, 0.3);
+  critic_nh_.param("curve_rotation", curve_rotation_, 0.9 * max_rotation_);
+  critic_nh_.param("curve_lookahead", curve_lookahead_, 1.0);
+  critic_nh_.param("plan_alignment_position_tolerance", plan_alignment_position_tolerance_, 0.15);
 
   intermediate_goal_pub_ = critic_nh_.advertise<geometry_msgs::PoseStamped>("intermediate_goal", 1);
-  articulation_points_pub_ = critic_nh_.advertise<sensor_msgs::PointCloud>("articulation_points", 1);
-  intermediate_goal_tolerance_pub_ =
-      critic_nh_.advertise<visualization_msgs::MarkerArray>("intermediate_goal_tolerance", 1);
-
-  articulation_angle_threshold_ = std::max(articulation_angle_threshold_, angle_threshold_);
-
-  // divide heading scale by position scale because the sum will be multiplied by scale again
-  heading_scale_ /= getScale();
-  last_progress_index_ = 0;
-  reached_intermediate_goals_.clear();
-  holding_goal_ = false;
-  held_goal_index_ = 0;
-  held_goal_pose_.x = 0.0;
-  held_goal_pose_.y = 0.0;
-  held_goal_pose_.theta = 0.0;
-  hold_position_epsilon_ = 1e-6;
-  hold_yaw_epsilon_ = 1e-6;
-  final_goal_yaw_tolerance_ = std::max(final_goal_yaw_tolerance_, 1e-6);
-  final_goal_xy_tolerance_ = std::max(final_goal_xy_tolerance_, 0.0);
-  have_last_plan_ = false;
-  last_plan_size_ = 0;
-  last_plan_end_pose_.x = 0.0;
-  last_plan_end_pose_.y = 0.0;
-  last_plan_end_pose_.theta = 0.0;
-  last_plan_frame_id_.clear();
-  last_plan_stamp_ = ros::Time(0);
-  last_plan_seq_ = 0u;
-  last_plan_start_pose_.x = 0.0;
-  last_plan_start_pose_.y = 0.0;
-  last_plan_start_pose_.theta = 0.0;
-  last_final_goal_pose_.x = 0.0;
-  last_final_goal_pose_.y = 0.0;
-  last_final_goal_pose_.theta = 0.0;
-  have_last_goal_pose_ = false;
-  critic_nh_.param("plan_alignment_position_tolerance", plan_alignment_position_tolerance_, 0.15);
-  critic_nh_.param("plan_alignment_yaw_tolerance", plan_alignment_yaw_tolerance_, 3.14159265358979323846);
+  reset();
 }
 
 void PathFollowerCritic::reset()
 {
-  reached_intermediate_goals_.clear();
-  last_progress_index_ = 0;
-  holding_goal_ = false;
-  held_goal_index_ = 0;
-  held_goal_pose_.x = 0.0;
-  held_goal_pose_.y = 0.0;
-  held_goal_pose_.theta = 0.0;
-  initial_alignment_done_ = false;
-  have_last_plan_ = false;
-  last_plan_size_ = 0;
-  last_plan_end_pose_.x = 0.0;
-  last_plan_end_pose_.y = 0.0;
-  last_plan_end_pose_.theta = 0.0;
-  last_plan_frame_id_.clear();
-  last_plan_stamp_ = ros::Time(0);
-  last_plan_seq_ = 0u;
-  last_plan_start_pose_.x = 0.0;
-  last_plan_start_pose_.y = 0.0;
-  last_plan_start_pose_.theta = 0.0;
-  last_final_goal_pose_.x = 0.0;
-  last_final_goal_pose_.y = 0.0;
-  last_final_goal_pose_.theta = 0.0;
-  have_last_goal_pose_ = false;
+  prepared_ = false;
+  turning_ = false;
+  vertices_.clear();
+  last_plan_.clear();
+  have_progress_ = false;
+  have_passed_stop_ = false;
+  have_turning_stop_ = false;
 }
 
-double PathFollowerCritic::scoreTrajectory(const dwb_msgs::Trajectory2D& traj)
+double PathFollowerCritic::desiredSpeed(double distance_to_stop) const
 {
-  double position_score = MapGridCritic::scoreTrajectory(traj);
-  double heading_diff = fabs(angles::shortest_angular_distance(traj.poses.back().theta, desired_angle_));
-  double heading_score = heading_diff * heading_diff;
-
-  return position_score + heading_scale_ * heading_score;
+  if (!(distance_to_stop > 0.0))
+  {
+    return 0.0;
+  }
+  double speed = std::min(max_speed_, approach_gain_ * distance_to_stop);
+  return std::min(speed, std::sqrt(2.0 * decel_ * distance_to_stop));
 }
 
-bool PathFollowerCritic::getGoalPose(const geometry_msgs::Pose2D& robot_pose, const geometry_msgs::Pose2D& final_goal,
-                                     const nav_2d_msgs::Path2D& global_plan, unsigned int& x, unsigned int& y,
-                                     double& desired_angle)
+double PathFollowerCritic::desiredRotation(double heading_error) const
 {
-  const nav_core2::Costmap& costmap = *costmap_;
-  const nav_grid::NavGridInfo& info = costmap.getInfo();
+  double magnitude = std::min(max_rotation_, rotation_gain_ * std::fabs(heading_error));
+  magnitude = std::min(magnitude, std::sqrt(2.0 * rot_decel_ * std::fabs(heading_error)));
+  return heading_error < 0.0 ? -magnitude : magnitude;
+}
 
-  if (global_plan.poses.empty())
+std::vector<PathFollowerCritic::Vertex> PathFollowerCritic::buildPolyline(const nav_2d_msgs::Path2D& plan,
+                                                                          const geometry_msgs::Pose2D& goal) const
+{
+  std::vector<Vertex> vertices;
+  const double merge_distance = 1e-3;
+  for (const auto& pose : plan.poses)
+  {
+    // In-place turns are encoded as several poses with identical XY; keep the first and last heading.
+    if (!vertices.empty() && std::hypot(pose.x - vertices.back().x, pose.y - vertices.back().y) < merge_distance)
+    {
+      vertices.back().theta_out = pose.theta;
+      continue;
+    }
+    Vertex vertex;
+    vertex.x = pose.x;
+    vertex.y = pose.y;
+    vertex.theta_in = pose.theta;
+    vertex.theta_out = pose.theta;
+    vertices.push_back(vertex);
+  }
+  if (vertices.empty())
+  {
+    return vertices;
+  }
+
+  for (size_t i = 0; i + 1 < vertices.size(); ++i)
+  {
+    Vertex& from = vertices[i];
+    Vertex& to = vertices[i + 1];
+    double dx = to.x - from.x, dy = to.y - from.y;
+    to.s = from.s + std::hypot(dx, dy);
+    from.forward = dx * std::cos(from.theta_out) + dy * std::sin(from.theta_out) >= 0.0;
+  }
+  if (vertices.size() > 1)
+  {
+    vertices.back().forward = vertices[vertices.size() - 2].forward;
+  }
+
+  // The transformed plan may be cropped to the local costmap; only a plan ending at the goal ends with a stop.
+  const Vertex& last = vertices.back();
+  bool ends_at_goal = std::hypot(last.x - goal.x, last.y - goal.y) <= plan_alignment_position_tolerance_;
+  for (size_t i = 0; i < vertices.size(); ++i)
+  {
+    Vertex& vertex = vertices[i];
+    double turn = std::fabs(angles::shortest_angular_distance(vertex.theta_in, vertex.theta_out));
+    bool reversal = i > 0 && i + 1 < vertices.size() && vertices[i - 1].forward != vertex.forward;
+    bool is_final = i + 1 == vertices.size() && ends_at_goal;
+    // Driving through a small turn only pays off while moving; at the plan start the robot stands still, and
+    // accelerating into a 22.5 degree kink swerved it 10 cm off the path.
+    bool initial = i == 0 && turn >= start_turn_angle_;
+    vertex.stop = turn >= stop_turn_angle_ || reversal || is_final || initial;
+  }
+  // A smaller initial mismatch (lattice snapping of the start heading) is corrected while driving off.
+  if (!vertices.front().stop)
+  {
+    vertices.front().theta_in = vertices.front().theta_out;
+  }
+  return filletCorners(vertices);
+}
+
+std::vector<PathFollowerCritic::Vertex> PathFollowerCritic::filletCorners(const std::vector<Vertex>& vertices) const
+{
+  // Replace the kink of every driven-through in-place turn by a quadratic Bezier arc between the points
+  // corner_fillet_length before and after it, so that the lateral and heading references agree on a path a
+  // moving robot can actually follow. Neighbouring corners and stop points limit the fillet length.
+  const double min_turn = 0.05;
+  auto isCorner = [&](size_t i) {
+    return !vertices[i].stop && i > 0 && i + 1 < vertices.size() &&
+           std::fabs(angles::shortest_angular_distance(vertices[i].theta_in, vertices[i].theta_out)) >= min_turn;
+  };
+  auto isAnchor = [&](size_t i) { return vertices[i].stop || isCorner(i); };
+  auto pointAt = [&](double s, size_t hint) {
+    // Interpolate the polyline at arc length s, searching from the vertex index hint.
+    size_t i = std::min(hint, vertices.size() - 2);
+    while (i > 0 && vertices[i].s > s) --i;
+    while (i + 2 < vertices.size() && vertices[i + 1].s < s) ++i;
+    const Vertex& a = vertices[i];
+    const Vertex& b = vertices[i + 1];
+    double t = b.s > a.s ? std::max(0.0, std::min(1.0, (s - a.s) / (b.s - a.s))) : 0.0;
+    Vertex v;
+    v.x = a.x + t * (b.x - a.x);
+    v.y = a.y + t * (b.y - a.y);
+    v.theta_in = v.theta_out =
+        angles::normalize_angle(a.theta_out + t * angles::shortest_angular_distance(a.theta_out, b.theta_in));
+    v.forward = a.forward;
+    return v;
+  };
+
+  std::vector<Vertex> out;
+  out.reserve(vertices.size() + 8);
+  double skip_until = -1.0;
+  for (size_t i = 0; i < vertices.size(); ++i)
+  {
+    const Vertex& corner = vertices[i];
+    if (corner.s < skip_until)
+    {
+      continue;
+    }
+    if (!isCorner(i) || corner_fillet_length_ <= 0.0)
+    {
+      out.push_back(corner);
+      continue;
+    }
+    size_t prev = i, next = i;
+    while (prev > 0 && !isAnchor(prev - 1)) --prev;
+    if (prev > 0) --prev;
+    while (next + 1 < vertices.size() && !isAnchor(next + 1)) ++next;
+    if (next + 1 < vertices.size()) ++next;
+    // Two neighbouring corners share the space between them; a stop point or the plan end only needs a margin.
+    double back = corner.s - vertices[prev].s, ahead = vertices[next].s - corner.s;
+    double length = std::min({ corner_fillet_length_, isCorner(prev) ? 0.5 * back : back - 0.02,
+                               isCorner(next) ? 0.5 * ahead : ahead - 0.02 });
+    if (length < 0.02)
+    {
+      out.push_back(corner);
+      continue;
+    }
+    while (!out.empty() && out.back().s > corner.s - length)
+    {
+      out.pop_back();
+    }
+    Vertex in = pointAt(corner.s - length, i);
+    Vertex exit = pointAt(corner.s + length, i);
+    out.push_back(in);
+    double turn = angles::shortest_angular_distance(corner.theta_in, corner.theta_out);
+    for (double t : { 0.25, 0.5, 0.75 })
+    {
+      Vertex v;
+      double a = (1.0 - t) * (1.0 - t), b = 2.0 * t * (1.0 - t), c = t * t;
+      v.x = a * in.x + b * corner.x + c * exit.x;
+      v.y = a * in.y + b * corner.y + c * exit.y;
+      v.theta_in = v.theta_out = angles::normalize_angle(corner.theta_in + t * turn);
+      v.forward = corner.forward;
+      out.push_back(v);
+    }
+    out.push_back(exit);
+    skip_until = corner.s + length;
+  }
+
+  // Recompute arc lengths and segment directions for the smoothed polyline.
+  out.front().s = 0.0;
+  for (size_t i = 0; i + 1 < out.size(); ++i)
+  {
+    Vertex& from = out[i];
+    Vertex& to = out[i + 1];
+    double dx = to.x - from.x, dy = to.y - from.y;
+    to.s = from.s + std::hypot(dx, dy);
+    from.forward = dx * std::cos(from.theta_out) + dy * std::sin(from.theta_out) >= 0.0;
+  }
+  if (out.size() > 1)
+  {
+    out.back().forward = out[out.size() - 2].forward;
+  }
+  return out;
+}
+
+PathFollowerCritic::Projection PathFollowerCritic::project(double x, double y, size_t first_segment,
+                                                           size_t last_segment, bool extend_ends) const
+{
+  Projection best;
+  best.distance = kInfinity;
+  if (vertices_.size() < 2)
+  {
+    best.x = vertices_.front().x;
+    best.y = vertices_.front().y;
+    best.distance = std::hypot(x - best.x, y - best.y);
+    return best;
+  }
+  last_segment = std::min(last_segment, vertices_.size() - 2);
+  for (size_t i = std::min(first_segment, last_segment); i <= last_segment; ++i)
+  {
+    const Vertex& a = vertices_[i];
+    const Vertex& b = vertices_[i + 1];
+    double dx = b.x - a.x, dy = b.y - a.y;
+    double length_sq = dx * dx + dy * dy;
+    double t = length_sq > 0.0 ? ((x - a.x) * dx + (y - a.y) * dy) / length_sq : 0.0;
+    // Optionally treat the outer segments as rays so that overshooting the window is not a lateral error.
+    if (!(extend_ends && i == first_segment))
+    {
+      t = std::max(0.0, t);
+    }
+    if (!(extend_ends && i == last_segment))
+    {
+      t = std::min(1.0, t);
+    }
+    double px = a.x + t * dx, py = a.y + t * dy;
+    double distance = std::hypot(x - px, y - py);
+    // Strictly better only: on ties keep the earliest segment so that loops in the plan don't skip ahead.
+    if (distance < best.distance)
+    {
+      best.segment = i;
+      best.t = t;
+      best.distance = distance;
+      best.s = a.s + t * (b.s - a.s);
+      best.x = px;
+      best.y = py;
+    }
+  }
+  return best;
+}
+
+bool PathFollowerCritic::locateRobot(const geometry_msgs::Pose2D& pose, bool passed_valid, size_t passed_index)
+{
+  size_t num_segments = vertices_.size() - 1;
+  if (num_segments == 0)
+  {
+    robot_ = project(pose.x, pose.y, 0, 0);
+    have_passed_stop_ = false;
+    have_turning_stop_ = false;
+    have_progress_ = true;
+    progress_x_ = robot_.x;
+    progress_y_ = robot_.y;
+    progress_segment_ = 0;
+    return true;
+  }
+
+  bool continuing = false;
+  size_t start = 0;
+  if (have_progress_)
+  {
+    // Re-identify the previous progress point in this plan. Pruning shifts the vertex indices by a few per
+    // cycle and the plan is re-transformed with some jitter, so among the segments (almost) containing the
+    // point take the one closest to the previous index: plans that cross or overlap themselves (SBPL loops,
+    // reversals) offer several equally close candidates.
+    Projection previous;
+    previous.distance = kInfinity;
+    size_t best_index_distance = std::numeric_limits<size_t>::max();
+    for (size_t i = 0; i < num_segments; ++i)
+    {
+      Projection candidate = project(progress_x_, progress_y_, i, i);
+      size_t index_distance = i > progress_segment_ ? i - progress_segment_ : progress_segment_ - i;
+      bool on_segment = candidate.distance <= 0.02;
+      bool previous_on_segment = previous.distance <= 0.02;
+      if ((on_segment && (!previous_on_segment || index_distance < best_index_distance)) ||
+          (!on_segment && !previous_on_segment && candidate.distance < previous.distance))
+      {
+        previous = candidate;
+        best_index_distance = index_distance;
+      }
+    }
+    if (previous.distance <= plan_alignment_position_tolerance_)
+    {
+      start = previous.segment;
+      continuing = true;
+    }
+  }
+
+  if (continuing)
+  {
+    // Progress is confined to the current motion segment: never project back before the passed stop point and
+    // never beyond the next one. Plans that fold back on themselves (reverse, turn, drive past the same spot)
+    // would otherwise let the robot skip a stop point.
+    if (passed_valid)
+    {
+      start = std::max(start, std::min(passed_index, num_segments - 1));
+    }
+    size_t last = start;
+    while (last + 1 < num_segments && vertices_[last + 1].s - vertices_[start].s < search_window_ &&
+           !(vertices_[last + 1].stop && !(passed_valid && last + 1 == passed_index)))
+    {
+      ++last;
+    }
+    robot_ = project(pose.x, pose.y, start, last);
+  }
+  else
+  {
+    // New plan or track lost: use the first local minimum of the distance to the plan that is within tolerance
+    // (not the global minimum) so that loops in the plan don't make the robot skip ahead.
+    have_passed_stop_ = false;
+    have_turning_stop_ = false;
+    robot_.distance = kInfinity;
+    bool near_plan = false;
+    for (size_t i = 0; i < num_segments; ++i)
+    {
+      Projection candidate = project(pose.x, pose.y, i, i);
+      if (near_plan && candidate.distance >= robot_.distance)
+      {
+        break;
+      }
+      if (candidate.distance < robot_.distance)
+      {
+        robot_ = candidate;
+      }
+      near_plan = near_plan || candidate.distance <= plan_alignment_position_tolerance_;
+    }
+  }
+  have_progress_ = true;
+  progress_x_ = robot_.x;
+  progress_y_ = robot_.y;
+  progress_segment_ = robot_.segment;
+  return true;
+}
+
+bool PathFollowerCritic::isContinuationOf(const std::vector<geometry_msgs::Pose2D>& plan,
+                                          const std::vector<geometry_msgs::Pose2D>& previous)
+{
+  if (plan.empty() || previous.empty())
+  {
+    return false;
+  }
+  // The plan is re-transformed into the costmap frame every cycle; with a localization that publishes the
+  // map->odom transform from noisy samples that moves the poses by several millimeters between cycles.
+  const double tolerance = 0.02;
+  const size_t run = std::min<size_t>(10, std::min(plan.size(), previous.size()));
+  for (size_t offset = 0; offset + run <= previous.size(); ++offset)
+  {
+    bool match = true;
+    for (size_t k = 0; k < run && match; ++k)
+    {
+      match = std::fabs(plan[k].x - previous[offset + k].x) < tolerance &&
+              std::fabs(plan[k].y - previous[offset + k].y) < tolerance &&
+              std::fabs(angles::shortest_angular_distance(plan[k].theta, previous[offset + k].theta)) < tolerance;
+    }
+    if (match)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PathFollowerCritic::findStop(const geometry_msgs::Pose2D& stop, size_t& index) const
+{
+  for (size_t i = 0; i < vertices_.size(); ++i)
+  {
+    if (vertices_[i].stop && std::hypot(vertices_[i].x - stop.x, vertices_[i].y - stop.y) <= 0.02 &&
+        std::fabs(angles::shortest_angular_distance(vertices_[i].theta_out, stop.theta)) <= 0.05)
+    {
+      index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+double PathFollowerCritic::pathHeading(const Projection& projection) const
+{
+  if (vertices_.size() < 2)
+  {
+    return vertices_.front().theta_out;
+  }
+  const Vertex& from = vertices_[projection.segment];
+  const Vertex& to = vertices_[projection.segment + 1];
+  double t = std::max(0.0, std::min(1.0, projection.t));
+  return angles::normalize_angle(from.theta_out + t * angles::shortest_angular_distance(from.theta_out, to.theta_in));
+}
+
+bool PathFollowerCritic::prepare(const geometry_msgs::Pose2D& pose, const nav_2d_msgs::Twist2D& vel,
+                                 const geometry_msgs::Pose2D& goal, const nav_2d_msgs::Path2D& global_plan)
+{
+  prepared_ = false;
+  turning_ = false;
+  vertices_ = buildPolyline(global_plan, goal);
+  if (vertices_.empty())
   {
     ROS_ERROR_NAMED("PathFollowerCritic", "The global plan was empty.");
     return false;
   }
+  const size_t num_segments = vertices_.size() - 1;
 
-  std::vector<geometry_msgs::Pose2D> plan = nav_2d_utils::adjustPlanResolution(global_plan, info.resolution).poses;
-
-  auto nearestPlanOrientation = [&](const geometry_msgs::Pose2D& query_pose) {
-    double best_distance = std::numeric_limits<double>::infinity();
-    double selected_orientation = query_pose.theta;
-
-    for (const auto& pose : global_plan.poses)
-    {
-      double dx = pose.x - query_pose.x;
-      double dy = pose.y - query_pose.y;
-      double distance = hypot(dx, dy);
-      if (distance < best_distance)
-      {
-        best_distance = distance;
-        selected_orientation = pose.theta;
-      }
-    }
-
-    return selected_orientation;
-  };
-
-  for (auto& pose : plan)
+  // DWB only prunes poses from the front of a plan and crops its tail, so the same plan still starts with a run
+  // of poses found back to back in the previous one. Anything else is a new plan: restart the progress tracking
+  // from its beginning instead of matching the old progress point, which a plan looping back near the robot
+  // (typical for SBPL) would match to its later part.
+  if (have_progress_ && !isContinuationOf(global_plan.poses, last_plan_))
   {
-    pose.theta = nearestPlanOrientation(pose);
+    ROS_DEBUG_NAMED("PathFollowerCritic", "New global plan received, restarting progress tracking.");
+    have_progress_ = false;
+    have_passed_stop_ = false;
+    have_turning_stop_ = false;
   }
+  last_plan_ = global_plan.poses;
 
-  auto posesDiffer = [&](const geometry_msgs::Pose2D& a, const geometry_msgs::Pose2D& b, double position_tolerance,
-                         double yaw_tolerance) {
-    double dx = a.x - b.x;
-    double dy = a.y - b.y;
-    double distance = hypot(dx, dy);
-    if (distance > position_tolerance)
+  // Re-identify the last passed stop point in this (possibly pruned) plan.
+  size_t passed_index = 0;
+  bool passed_valid = have_passed_stop_ && findStop(passed_stop_, passed_index);
+  have_passed_stop_ = passed_valid;
+  locateRobot(pose, passed_valid, passed_index);
+  passed_valid = have_passed_stop_;  // a new plan discards it
+
+  auto nextStop = [&](size_t from, size_t& index) {
+    for (size_t i = std::max(from, robot_.segment); i < vertices_.size(); ++i)
     {
+      if (!vertices_[i].stop || (passed_valid && i == passed_index) ||
+          vertices_[i].s < robot_.s - xy_local_goal_tolerance_)
+      {
+        continue;
+      }
+      index = i;
       return true;
     }
-
-    double yaw_error = fabs(angles::shortest_angular_distance(a.theta, b.theta));
-    return yaw_error > yaw_tolerance;
-  };
-
-  if (plan.empty())
-  {
-    ROS_ERROR_NAMED("PathFollowerCritic", "The adjusted global plan was empty.");
     return false;
-  }
-
-  auto planPoseMatchesFinalGoal = [&](const geometry_msgs::Pose2D& plan_pose) {
-    return !posesDiffer(plan_pose, final_goal, plan_alignment_position_tolerance_, plan_alignment_yaw_tolerance_);
   };
 
-  bool final_goal_in_plan_window = planPoseMatchesFinalGoal(plan.back());
-
-  auto matchPoseToPlanIndex = [&](const geometry_msgs::Pose2D& pose, unsigned int& index_out) {
-    bool found = false;
-    double best_distance = std::numeric_limits<double>::infinity();
-
-    for (unsigned int idx = 0; idx < plan.size(); ++idx)
+  // Driving direction of the segment ahead of the robot: the one leaving a stop point that was passed in this
+  // very cycle (the robot still projects onto the segment arriving there), else the current segment.
+  auto directionAhead = [&]() {
+    size_t direction_segment = std::min(robot_.segment, num_segments > 0 ? num_segments - 1 : 0);
+    if (passed_valid && robot_.segment < passed_index && passed_index < num_segments)
     {
-      double dx = plan[idx].x - pose.x;
-      double dy = plan[idx].y - pose.y;
-      double distance = hypot(dx, dy);
-      if (distance > plan_alignment_position_tolerance_)
-      {
-        continue;
-      }
-
-      double yaw_error = fabs(angles::shortest_angular_distance(plan[idx].theta, pose.theta));
-      if (yaw_error > plan_alignment_yaw_tolerance_)
-      {
-        continue;
-      }
-
-      if (distance < best_distance)
-      {
-        best_distance = distance;
-        index_out = idx;
-        found = true;
-      }
+      direction_segment = passed_index;
     }
-
-    return found;
+    else if (robot_.t >= 1.0 - 1e-9 && robot_.segment + 1 < num_segments)
+    {
+      direction_segment = robot_.segment + 1;
+    }
+    return vertices_[direction_segment].forward ? 1.0 : -1.0;
   };
+  speed_direction_ = directionAhead();
 
-  // Reset state if a new global plan arrives (detected via metadata changes or major window shifts)
-  bool plan_changed = false;
-  geometry_msgs::Pose2D plan_start_pose = plan.front();
-
-  auto headerStampChanged = [&]() {
-    if (last_plan_stamp_.isZero() || global_plan.header.stamp.isZero())
-    {
-      return false;
-    }
-    return last_plan_stamp_ != global_plan.header.stamp;
-  };
-
-  auto headerSeqChanged = [&]() {
-    if (!have_last_plan_)
-    {
-      return false;
-    }
-    return last_plan_seq_ != global_plan.header.seq;
-  };
-
-  auto goalPoseChanged = [&]() {
-    if (!have_last_goal_pose_)
-    {
-      return true;
-    }
-    return posesDiffer(final_goal, last_final_goal_pose_, plan_alignment_position_tolerance_,
-                       plan_alignment_yaw_tolerance_);
-  };
-
-  auto planStartChanged = [&]() {
-    if (!have_last_plan_)
-    {
-      return true;
-    }
-    // Allow the cropped window to slide by a generous distance without counting as a full plan change.
-    double position_tolerance = std::max(plan_alignment_position_tolerance_ * 4.0, plan_alignment_position_tolerance_);
-    return posesDiffer(plan_start_pose, last_plan_start_pose_, position_tolerance, plan_alignment_yaw_tolerance_);
-  };
-
-  if (!have_last_plan_ || global_plan.header.frame_id != last_plan_frame_id_ || headerStampChanged() ||
-      headerSeqChanged() || goalPoseChanged())
+  size_t stop_index = 0;
+  bool have_stop = false;
+  if (have_turning_stop_ && findStop(turning_stop_, stop_index))
   {
-    plan_changed = true;
-  }
-  else if (planStartChanged())
-  {
-    plan_changed = true;
-  }
-
-  if (plan_changed)
-  {
-    bool state_preserved = false;
-    bool progress_match_found = false;
-    unsigned int restored_progress_index = 0u;
-    std::vector<std::pair<unsigned int, geometry_msgs::Pose2D>> preserved_reached;
-    preserved_reached.reserve(reached_intermediate_goals_.size());
-
-    unsigned int previous_progress_index = last_progress_index_;
-
-    for (const auto& reached_pose : reached_intermediate_goals_)
-    {
-      unsigned int matched_index = 0u;
-      if (matchPoseToPlanIndex(reached_pose, matched_index))
-      {
-        geometry_msgs::Pose2D preserved_pose = reached_pose;
-        preserved_pose.x = plan[matched_index].x;
-        preserved_pose.y = plan[matched_index].y;
-        preserved_pose.theta = nearestPlanOrientation(preserved_pose);
-        preserved_reached.emplace_back(matched_index, preserved_pose);
-        state_preserved = true;
-        progress_match_found = true;
-        restored_progress_index = std::max(restored_progress_index, matched_index);
-      }
-    }
-
-    unsigned int held_match_index = 0u;
-    if (holding_goal_)
-    {
-      if (matchPoseToPlanIndex(held_goal_pose_, held_match_index))
-      {
-        state_preserved = true;
-        held_goal_index_ = held_match_index;
-        held_goal_pose_.x = plan[held_match_index].x;
-        held_goal_pose_.y = plan[held_match_index].y;
-        held_goal_pose_.theta = nearestPlanOrientation(held_goal_pose_);
-      }
-      else
-      {
-        holding_goal_ = false;
-        held_goal_index_ = 0u;
-        held_goal_pose_.x = 0.0;
-        held_goal_pose_.y = 0.0;
-        held_goal_pose_.theta = 0.0;
-      }
-    }
-
-    unsigned int robot_match_index = 0u;
-    if (matchPoseToPlanIndex(robot_pose, robot_match_index))
-    {
-      state_preserved = true;
-
-      double match_goal_yaw = nearestPlanOrientation(plan[robot_match_index]);
-
-      bool match_is_final_index = ((robot_match_index + 1u) >= plan.size()) && final_goal_in_plan_window;
-      double match_yaw_tolerance = match_is_final_index ? final_goal_yaw_tolerance_ : yaw_local_goal_tolerance_;
-      double yaw_error = fabs(angles::shortest_angular_distance(robot_pose.theta, match_goal_yaw));
-
-      if (yaw_error <= match_yaw_tolerance)
-      {
-        progress_match_found = true;
-        restored_progress_index = std::max(restored_progress_index, robot_match_index);
-      }
-      else
-      {
-        ROS_DEBUG_NAMED("PathFollowerCritic",
-                        "Robot pose matched plan index %u but yaw error %.3f rad exceeds tolerance %.3f."
-                        " Preserving state without increasing progress.",
-                        robot_match_index, yaw_error, match_yaw_tolerance);
-      }
-    }
-
-    if (state_preserved)
-    {
-      if (progress_match_found)
-      {
-        std::sort(preserved_reached.begin(), preserved_reached.end(),
-                  [](const std::pair<unsigned int, geometry_msgs::Pose2D>& lhs,
-                     const std::pair<unsigned int, geometry_msgs::Pose2D>& rhs) { return lhs.first < rhs.first; });
-        reached_intermediate_goals_.clear();
-        reached_intermediate_goals_.reserve(preserved_reached.size());
-        for (const auto& entry : preserved_reached)
-        {
-          reached_intermediate_goals_.push_back(entry.second);
-        }
-        unsigned int plan_last_index = plan.empty() ? 0u : static_cast<unsigned int>(plan.size() - 1);
-        last_progress_index_ = std::min(restored_progress_index, plan_last_index);
-      }
-      else
-      {
-        reached_intermediate_goals_.clear();
-        unsigned int plan_last_index = plan.empty() ? 0u : static_cast<unsigned int>(plan.size() - 1);
-        last_progress_index_ = std::min(previous_progress_index, plan_last_index);
-      }
-    }
-    else
-    {
-      reached_intermediate_goals_.clear();
-      last_progress_index_ = 0u;
-      holding_goal_ = false;
-      held_goal_index_ = 0u;
-      held_goal_pose_.x = 0.0;
-      held_goal_pose_.y = 0.0;
-      held_goal_pose_.theta = 0.0;
-      initial_alignment_done_ = false;
-    }
-
-    have_last_plan_ = true;
-  }
-
-  last_plan_size_ = plan.size();
-  last_plan_end_pose_ = plan.back();
-  last_plan_frame_id_ = global_plan.header.frame_id;
-  last_plan_stamp_ = global_plan.header.stamp;
-  last_plan_seq_ = global_plan.header.seq;
-  last_plan_start_pose_ = plan_start_pose;
-  last_final_goal_pose_ = final_goal;
-  have_last_goal_pose_ = true;
-
-  unsigned int plan_last_index = static_cast<unsigned int>(plan.size() - 1);
-
-  if (initial_alignment_done_ && plan.size() > 1 && last_progress_index_ > 0)
-  {
-    unsigned int prune_limit = std::min(last_progress_index_, plan_last_index);
-    if (prune_limit > 0)
-    {
-      plan.erase(plan.begin(), plan.begin() + prune_limit);
-      last_progress_index_ = last_progress_index_ >= prune_limit ? last_progress_index_ - prune_limit : 0;
-      plan_last_index = static_cast<unsigned int>(plan.size() - 1);
-
-      if (holding_goal_)
-      {
-        if (held_goal_index_ < prune_limit)
-        {
-          holding_goal_ = false;
-          held_goal_index_ = 0;
-        }
-        else
-        {
-          held_goal_index_ -= prune_limit;
-        }
-      }
-    }
-  }
-
-  if (holding_goal_ && held_goal_index_ >= plan.size())
-  {
-    ROS_DEBUG_NAMED("PathFollowerCritic",
-                    "Held goal index %u is out of range for current plan of size %zu. Releasing hold.",
-                    held_goal_index_, plan.size());
-    holding_goal_ = false;
-    held_goal_index_ = 0;
-  }
-
-  // find the "start pose", i.e. the pose on the plan closest to the robot that is also on the local map
-  unsigned int start_index = 0;
-  double distance_to_start = std::numeric_limits<double>::infinity();
-  bool started_path = false;
-  for (unsigned int i = 0; i < plan.size(); i++)
-  {
-    double g_x = plan[i].x;
-    double g_y = plan[i].y;
-    unsigned int map_x, map_y;
-    if (worldToGridBounded(info, g_x, g_y, map_x, map_y) && costmap(map_x, map_y) != nav_core2::Costmap::NO_INFORMATION)
-    {
-      // Still on the costmap. Continue.
-      double distance = nav_2d_utils::poseDistance(plan[i], robot_pose);
-      if (distance_to_start > distance)
-      {
-        start_index = i;
-        distance_to_start = distance;
-        started_path = true;
-      }
-      else
-      {
-        // Plan is going away from the robot again. It's possible that it comes back and we would find a pose that's
-        // even closer to the robot, but then we would skip over parts of the plan.
-        break;
-      }
-    }
-    else if (started_path)
-    {
-      // Off the costmap after being on the costmap.
-      break;
-    }
-    // else, we have not yet found a point on the costmap, so we just continue
-  }
-
-  if (!started_path)
-  {
-    ROS_ERROR_NAMED("PathFollowerCritic", "None of the points of the global plan were in the local costmap.");
-    return false;
-  }
-
-  // find the "last valid pose", i.e. the last pose on the plan after the start pose that is still on the local map
-  unsigned int last_valid_index = start_index;
-  for (unsigned int i = start_index + 1; i < plan.size(); i++)
-  {
-    double g_x = plan[i].x;
-    double g_y = plan[i].y;
-    unsigned int map_x, map_y;
-    if (worldToGridBounded(info, g_x, g_y, map_x, map_y) && costmap(map_x, map_y) != nav_core2::Costmap::NO_INFORMATION)
-    {
-      // Still on the costmap. Continue.
-      last_valid_index = i;
-    }
-    else
-    {
-      // Off the costmap after being on the costmap.
-      break;
-    }
-  }
-
-  auto collectArticulationIndices = [&](unsigned int scan_start, unsigned int scan_end) {
-    std::vector<unsigned int> articulation_indices;
-    if (plan.size() < 2)
-    {
-      return articulation_indices;
-    }
-
-    const double epsilon = 1e-9;
-    unsigned int clamped_start = std::max(scan_start, 1u);
-    unsigned int clamped_end = std::min(scan_end, plan_last_index);
-    if (clamped_start > clamped_end)
-    {
-      return articulation_indices;
-    }
-
-    double previous_segment_angle = 0.0;
-    bool previous_segment_angle_set = false;
-    unsigned int previous_segment_end_index = 0u;
-
-    for (unsigned int i = clamped_start; i <= clamped_end; ++i)
-    {
-      double direction_x = plan[i].x - plan[i - 1].x;
-      double direction_y = plan[i].y - plan[i - 1].y;
-      double length = hypot(direction_x, direction_y);
-      if (length < epsilon)
-      {
-        continue;
-      }
-
-      double current_angle = atan2(direction_y, direction_x);
-      if (previous_segment_angle_set)
-      {
-        double articulation_angle = fabs(angles::shortest_angular_distance(previous_segment_angle, current_angle));
-        if (articulation_angle >= articulation_angle_threshold_)
-        {
-          if (articulation_indices.empty() || articulation_indices.back() != previous_segment_end_index)
-          {
-            articulation_indices.push_back(previous_segment_end_index);
-          }
-        }
-      }
-
-      previous_segment_angle = current_angle;
-      previous_segment_angle_set = true;
-      previous_segment_end_index = i;
-    }
-
-    return articulation_indices;
-  };
-
-  auto publishArticulationPointCloud = [&](const std::vector<unsigned int>& articulation_indices) {
-    if (!articulation_points_pub_)
-    {
-      return;
-    }
-
-    sensor_msgs::PointCloud cloud_msg;
-    cloud_msg.header = global_plan.header;
-    cloud_msg.header.stamp = ros::Time::now();
-    cloud_msg.points.reserve(articulation_indices.size());
-
-    for (unsigned int index : articulation_indices)
-    {
-      if (index >= plan.size())
-      {
-        continue;
-      }
-
-      geometry_msgs::Point32 point;
-      point.x = plan[index].x;
-      point.y = plan[index].y;
-      point.z = 0.0;
-      cloud_msg.points.push_back(point);
-    }
-
-    articulation_points_pub_.publish(cloud_msg);
-  };
-
-  auto publishIntermediateGoal = [&](const geometry_msgs::Pose2D& goal_pose, double goal_yaw) {
-    if (!intermediate_goal_pub_)
-    {
-      return;
-    }
-    geometry_msgs::PoseStamped goal_msg;
-    goal_msg.header = global_plan.header;
-    goal_msg.header.stamp = ros::Time::now();
-    goal_msg.pose.position.x = goal_pose.x;
-    goal_msg.pose.position.y = goal_pose.y;
-    goal_msg.pose.position.z = 0.0;
-    tf2::Quaternion q;
-    q.setRPY(0.0, 0.0, goal_yaw);
-    goal_msg.pose.orientation.x = q.x();
-    goal_msg.pose.orientation.y = q.y();
-    goal_msg.pose.orientation.z = q.z();
-    goal_msg.pose.orientation.w = q.w();
-    intermediate_goal_pub_.publish(goal_msg);
-
-    if (intermediate_goal_tolerance_pub_)
-    {
-      visualization_msgs::MarkerArray marker_array;
-      visualization_msgs::Marker marker;
-      marker.header = goal_msg.header;
-      marker.header.stamp = goal_msg.header.stamp;
-      marker.ns = "intermediate_goal_tolerance";
-      marker.id = 0;
-      marker.type = visualization_msgs::Marker::SPHERE;
-      marker.action = visualization_msgs::Marker::ADD;
-      marker.pose.position = goal_msg.pose.position;
-      marker.pose.orientation.x = 0.0;
-      marker.pose.orientation.y = 0.0;
-      marker.pose.orientation.z = 0.0;
-      marker.pose.orientation.w = 1.0;
-      double diameter = std::max(2.0 * xy_local_goal_tolerance_, 1e-6);
-      marker.scale.x = diameter;
-      marker.scale.y = diameter;
-      marker.scale.z = diameter;
-      marker.color.r = 0.2f;
-      marker.color.g = 0.8f;
-      marker.color.b = 0.4f;
-      marker.color.a = 0.35f;
-      marker.lifetime = ros::Duration(0.0);
-      marker_array.markers.push_back(marker);
-      intermediate_goal_tolerance_pub_.publish(marker_array);
-    }
-  };
-
-  if (!initial_alignment_done_)
-  {
-    double desired_initial_yaw = nearestPlanOrientation(robot_pose);
-
-    double yaw_error = fabs(angles::shortest_angular_distance(robot_pose.theta, desired_initial_yaw));
-    if (yaw_error >= yaw_local_goal_tolerance_)
-    {
-      unsigned int rx = 0;
-      unsigned int ry = 0;
-      if (worldToGridBounded(info, robot_pose.x, robot_pose.y, rx, ry))
-      {
-        x = rx;
-        y = ry;
-        desired_angle = desired_initial_yaw;
-        held_goal_pose_.x = robot_pose.x;
-        held_goal_pose_.y = robot_pose.y;
-        held_goal_pose_.theta = desired_initial_yaw;
-        held_goal_index_ = 0;
-        holding_goal_ = true;
-        publishIntermediateGoal(held_goal_pose_, held_goal_pose_.theta);
-        ROS_DEBUG_NAMED("PathFollowerCritic",
-                        "Initial alignment: rotate in place to yaw %.3f rad at robot pose (x: %.3f, y: %.3f)",
-                        held_goal_pose_.theta, held_goal_pose_.x, held_goal_pose_.y);
-        return true;
-      }
-    }
-
-    initial_alignment_done_ = true;
-  }
-
-  std::vector<unsigned int> articulation_indices = collectArticulationIndices(1u, plan_last_index);
-  publishArticulationPointCloud(articulation_indices);
-
-  if (holding_goal_)
-  {
-    unsigned int held_x = 0;
-    unsigned int held_y = 0;
-    bool held_in_costmap = worldToGridBounded(info, held_goal_pose_.x, held_goal_pose_.y, held_x, held_y);
-
-    if (!held_in_costmap)
-    {
-      ROS_WARN_NAMED("PathFollowerCritic",
-                     "Held goal (index %u) is outside the local costmap. Releasing hold to search for a new goal.",
-                     held_goal_index_);
-      holding_goal_ = false;
-      held_goal_index_ = 0;
-    }
-    else
-    {
-      double held_xy_tolerance = (final_goal_in_plan_window && held_goal_index_ == plan_last_index) ?
-                                     final_goal_xy_tolerance_ :
-                                     xy_local_goal_tolerance_;
-      double held_yaw_tolerance = (final_goal_in_plan_window && held_goal_index_ == plan_last_index) ?
-                                      final_goal_yaw_tolerance_ :
-                                      yaw_local_goal_tolerance_;
-
-      double yaw_error = fabs(angles::shortest_angular_distance(robot_pose.theta, held_goal_pose_.theta));
-      if (yaw_error >= held_yaw_tolerance)
-      {
-        x = held_x;
-        y = held_y;
-        desired_angle = held_goal_pose_.theta;
-        publishIntermediateGoal(held_goal_pose_, held_goal_pose_.theta);
-        ROS_DEBUG_NAMED("PathFollowerCritic", "Holding goal index %u due to yaw error %.3f rad (threshold %.3f)",
-                        held_goal_index_, yaw_error, held_yaw_tolerance);
-        return true;
-      }
-
-      if (!isPoseReached(robot_pose, held_goal_pose_, held_goal_pose_.theta, held_xy_tolerance, held_yaw_tolerance))
-      {
-        x = held_x;
-        y = held_y;
-        desired_angle = held_goal_pose_.theta;
-        publishIntermediateGoal(held_goal_pose_, held_goal_pose_.theta);
-        ROS_DEBUG_NAMED("PathFollowerCritic", "Holding goal index %u until full pose tolerance satisfied (XY + yaw)",
-                        held_goal_index_);
-        return true;
-      }
-
-      last_progress_index_ = std::max(last_progress_index_, held_goal_index_);
-      geometry_msgs::Pose2D reached_pose = held_goal_pose_;
-      if (reached_intermediate_goals_.empty() ||
-          nav_2d_utils::poseDistance(reached_intermediate_goals_.back(), reached_pose) > 1e-6 ||
-          fabs(angles::shortest_angular_distance(reached_intermediate_goals_.back().theta, reached_pose.theta)) > 1e-6)
-      {
-        reached_intermediate_goals_.push_back(reached_pose);
-      }
-      ROS_DEBUG_NAMED(
-          "PathFollowerCritic",
-          "Reached held intermediate goal index %u while respecting pose tolerances. last_progress_index_: %u",
-          held_goal_index_, last_progress_index_);
-      holding_goal_ = false;
-    }
-  }
-
-  // Constrain the search range to enforce monotonic progress with the updated bookkeeping.
-  last_progress_index_ = std::min(last_progress_index_, plan_last_index);
-
-  unsigned int search_start_index = std::max(start_index, last_progress_index_);
-  search_start_index = std::min(search_start_index, last_valid_index);
-
-  if (holding_goal_ && held_goal_index_ >= last_progress_index_)
-  {
-    search_start_index = std::min(search_start_index, held_goal_index_);
-  }
-
-  unsigned int articulation_scan_start = 0u;
-  if (plan_last_index >= 1)
-  {
-    unsigned int next_index = last_progress_index_ < plan_last_index ? last_progress_index_ + 1 : plan_last_index;
-    articulation_scan_start = std::max(next_index, 1u);
+    have_stop = true;
   }
   else
   {
-    articulation_scan_start = plan_last_index;
+    have_turning_stop_ = false;
+    have_stop = nextStop(0, stop_index);
   }
 
-  auto articulationSearchStart = [&](unsigned int candidate_start) {
-    return std::max({ candidate_start, articulation_scan_start, 1u });
-  };
-
-  unsigned int goal_index = search_start_index;
-  double goal_yaw = nearestPlanOrientation(plan[goal_index]);
-  bool has_forward_direction = false;
-  bool found_goal = false;
-  bool forced_skipped_articulation = false;
-  unsigned int next_articulation_index = 0;
-  double next_articulation_yaw = 0.0;
-  bool next_articulation_has_forward = false;
-  bool has_next_articulation = false;
-
-  if (initial_alignment_done_ && !articulation_indices.empty())
+  double distance_to_stop = kInfinity;
+  while (have_stop)
   {
-    unsigned int articulation_window_start = std::max(search_start_index, last_progress_index_ + 1);
-    unsigned int articulation_window_end = last_valid_index;
-
-    for (unsigned int idx : articulation_indices)
+    const Vertex& stop = vertices_[stop_index];
+    distance_to_stop = stop.s - robot_.s;
+    bool is_final = stop_index + 1 == vertices_.size();
+    double reach_tolerance = is_final ? xy_final_goal_tolerance_ : xy_local_goal_tolerance_;
+    if (is_final && distance_to_stop < 0.1)
     {
-      if (idx < articulation_window_start || idx > articulation_window_end)
-      {
-        continue;
-      }
-
-      double articulation_yaw = nearestPlanOrientation(plan[idx]);
-      bool articulation_has_forward = hasForwardProgress(plan, idx);
-      double articulation_goal_yaw = articulation_yaw;
-
-      double articulation_xy_tolerance =
-          (final_goal_in_plan_window && idx == plan_last_index) ? final_goal_xy_tolerance_ : xy_local_goal_tolerance_;
-      double articulation_yaw_tolerance =
-          (final_goal_in_plan_window && idx == plan_last_index) ? final_goal_yaw_tolerance_ : yaw_local_goal_tolerance_;
-
-      if (isPoseReached(robot_pose, plan[idx], articulation_goal_yaw, articulation_xy_tolerance,
-                        articulation_yaw_tolerance))
-      {
-        last_progress_index_ = std::max(last_progress_index_, idx);
-        geometry_msgs::Pose2D reached_pose = plan[idx];
-        reached_pose.theta = nearestPlanOrientation(reached_pose);
-        if (reached_intermediate_goals_.empty() ||
-            nav_2d_utils::poseDistance(reached_intermediate_goals_.back(), reached_pose) > 1e-6 ||
-            fabs(angles::shortest_angular_distance(reached_intermediate_goals_.back().theta, reached_pose.theta)) > 1e-6)
-        {
-          reached_intermediate_goals_.push_back(reached_pose);
-        }
-        continue;
-      }
-
-      next_articulation_index = idx;
-      next_articulation_yaw = articulation_goal_yaw;
-      next_articulation_has_forward = articulation_has_forward;
-      has_next_articulation = true;
+      // The last bit of the plan is the jump from the lattice to the exact goal, which may be sideways. Only the
+      // distance along the robot's heading can still be closed; a residual lateral offset is the goal checker's.
+      double along = (stop.x - pose.x) * std::cos(pose.theta) + (stop.y - pose.y) * std::sin(pose.theta);
+      distance_to_stop = std::min(distance_to_stop, std::max(0.0, speed_direction_ * along));
+    }
+    if (!have_turning_stop_ && distance_to_stop > reach_tolerance + 1e-3)
+    {
+      break;  // still driving towards it
+    }
+    double heading_error = angles::shortest_angular_distance(pose.theta, stop.theta_out);
+    if (is_final || std::fabs(heading_error) > yaw_local_goal_tolerance_)
+    {
+      // Turn in place; the final pose is only released by the goal checker.
+      turning_ = true;
+      have_turning_stop_ = true;
+      turning_stop_ = makePose(stop.x, stop.y, stop.theta_out);
+      target_ = turning_stop_;
+      desired_speed_ = 0.0;
+      desired_rotation_ = desiredRotation(heading_error);
       break;
     }
+    // Aligned with the outgoing direction: this stop point is done.
+    have_passed_stop_ = true;
+    passed_valid = true;
+    passed_index = stop_index;
+    passed_stop_ = makePose(stop.x, stop.y, stop.theta_out);
+    have_turning_stop_ = false;
+    have_stop = nextStop(stop_index + 1, stop_index);
+    distance_to_stop = kInfinity;
   }
 
-  if (!found_goal && initial_alignment_done_ && search_start_index > last_progress_index_ + 1 &&
-      !articulation_indices.empty())
+  if (!turning_)
   {
-    unsigned int articulation_lower_bound = std::max(last_progress_index_ + 1, 1u);
-    unsigned int articulation_upper_bound = std::min(search_start_index - 1, last_valid_index);
-
-    if (articulation_lower_bound <= articulation_upper_bound)
+    speed_direction_ = directionAhead();
+    double speed = desiredSpeed(distance_to_stop);
+    // Curvature limit: the path ahead must be drivable with the angular velocity available, and the robot has to
+    // be able to brake to that speed before getting there.
+    if (curve_rotation_ > 0.0)
     {
-      auto articulation_it =
-          std::find_if(articulation_indices.begin(), articulation_indices.end(), [&](unsigned int index) {
-            return index >= articulation_lower_bound && index <= articulation_upper_bound;
-          });
-
-      if (articulation_it != articulation_indices.end())
+      size_t last_segment = have_stop && stop_index > 0 ? stop_index - 1 : (num_segments > 0 ? num_segments - 1 : 0);
+      for (size_t k = robot_.segment; k <= last_segment && k < num_segments; ++k)
       {
-        goal_index = *articulation_it;
-        has_forward_direction = hasForwardProgress(plan, goal_index);
-        goal_yaw = nearestPlanOrientation(plan[goal_index]);
-
-        if (enforce_forward_dot_ && has_forward_direction)
-        {
-          double to_goal_x = plan[goal_index].x - robot_pose.x;
-          double to_goal_y = plan[goal_index].y - robot_pose.y;
-          double dot = to_goal_x * std::cos(goal_yaw) + to_goal_y * std::sin(goal_yaw);
-          if (dot < 0.0)
-          {
-            ROS_WARN_NAMED("PathFollowerCritic",
-                           "Forcing skipped articulation index %u despite backward dot product %.3f due to policy.",
-                           goal_index, dot);
-          }
-        }
-
-        forced_skipped_articulation = true;
-        found_goal = true;
-        ROS_DEBUG_NAMED("PathFollowerCritic",
-                        "Recovered skipped articulation index %u between progress %u and search start %u.", goal_index,
-                        last_progress_index_, search_start_index);
-      }
-    }
-  }
-
-  unsigned int search_index = search_start_index;
-  while (!forced_skipped_articulation && search_index <= last_valid_index)
-  {
-    double candidate_yaw = goal_yaw;
-    bool candidate_has_forward = false;
-    unsigned int candidate_index = getGoalIndex(plan, search_index, last_valid_index, final_goal_in_plan_window,
-                                                candidate_yaw, candidate_has_forward);
-
-    bool forced_articulation = false;
-    if (candidate_index > last_progress_index_)
-    {
-      unsigned int articulation_index = 0;
-      double articulation_yaw = candidate_yaw;
-      bool articulation_has_forward = candidate_has_forward;
-      unsigned int articulation_start_index = articulationSearchStart(search_index);
-      if (articulation_start_index <= candidate_index &&
-          findNextArticulation(plan, articulation_start_index, candidate_index, last_valid_index, articulation_index,
-                               articulation_yaw, articulation_has_forward))
-      {
-        candidate_index = articulation_index;
-        candidate_yaw = articulation_yaw;
-        candidate_has_forward = articulation_has_forward;
-        forced_articulation = true;
-      }
-    }
-
-    if (!forced_articulation)
-    {
-      candidate_index = std::max(candidate_index, search_index);
-    }
-
-    if (has_next_articulation && candidate_index >= next_articulation_index)
-    {
-      goal_index = next_articulation_index;
-      goal_yaw = next_articulation_yaw;
-      has_forward_direction = next_articulation_has_forward;
-      found_goal = true;
-      forced_skipped_articulation = true;
-      has_next_articulation = false;
-      ROS_DEBUG_NAMED("PathFollowerCritic", "Selecting pending articulation index %u reached at candidate %u.",
-                      goal_index, candidate_index);
-      break;
-    }
-
-    double candidate_xy_tolerance = (final_goal_in_plan_window && candidate_index == plan_last_index) ?
-                                        final_goal_xy_tolerance_ :
-                                        xy_local_goal_tolerance_;
-    double candidate_yaw_tolerance = (final_goal_in_plan_window && candidate_index == plan_last_index) ?
-                                         final_goal_yaw_tolerance_ :
-                                         yaw_local_goal_tolerance_;
-
-    if (isPoseReached(robot_pose, plan[candidate_index], candidate_yaw, candidate_xy_tolerance, candidate_yaw_tolerance))
-    {
-      last_progress_index_ = std::max(last_progress_index_, candidate_index);
-      geometry_msgs::Pose2D reached_pose = plan[candidate_index];
-      reached_pose.theta = nearestPlanOrientation(reached_pose);
-      if (reached_intermediate_goals_.empty() ||
-          nav_2d_utils::poseDistance(reached_intermediate_goals_.back(), reached_pose) > 1e-6 ||
-          fabs(angles::shortest_angular_distance(reached_intermediate_goals_.back().theta, reached_pose.theta)) > 1e-6)
-      {
-        reached_intermediate_goals_.push_back(reached_pose);
-      }
-      ROS_DEBUG_NAMED("PathFollowerCritic", "Reached intermediate goal index %u. last_progress_index_: %u",
-                      candidate_index, last_progress_index_);
-
-      if (candidate_index >= last_valid_index)
-      {
-        goal_index = candidate_index;
-        goal_yaw = candidate_yaw;
-        has_forward_direction = candidate_has_forward;
-        found_goal = true;
-        break;
-      }
-
-      search_index = candidate_index + 1;
-      continue;
-    }
-
-    if (enforce_forward_dot_ && candidate_has_forward && !forced_articulation)
-    {
-      double to_goal_x = plan[candidate_index].x - robot_pose.x;
-      double to_goal_y = plan[candidate_index].y - robot_pose.y;
-      double dot = to_goal_x * std::cos(candidate_yaw) + to_goal_y * std::sin(candidate_yaw);
-      if (dot < 0.0)
-      {
-        ROS_DEBUG_NAMED("PathFollowerCritic", "Skipping goal index %u due to backward alignment (dot product %.3f)",
-                        candidate_index, dot);
-        if (candidate_index >= last_valid_index)
+        const Vertex& from = vertices_[k];
+        const Vertex& to = vertices_[k + 1];
+        double ahead = std::max(0.0, from.s - robot_.s);
+        if (ahead > curve_lookahead_)
         {
           break;
         }
-        search_index = candidate_index + 1;
-        continue;
-      }
-    }
-
-    goal_index = candidate_index;
-    goal_yaw = candidate_yaw;
-    has_forward_direction = candidate_has_forward;
-    found_goal = true;
-    break;
-  }
-
-  if (!found_goal)
-  {
-    unsigned int fallback_start = std::min(last_valid_index, search_start_index);
-    goal_index = fallback_start;
-    bool selected_fallback = false;
-
-    for (; goal_index <= last_valid_index; ++goal_index)
-    {
-      goal_yaw = nearestPlanOrientation(plan[goal_index]);
-      has_forward_direction = hasForwardProgress(plan, goal_index);
-      if (has_forward_direction)
-      {
-        if (!enforce_forward_dot_)
+        double length = to.s - from.s;
+        if (length < 1e-3)
         {
-          selected_fallback = true;
-          break;
+          continue;
         }
-
-        double to_goal_x = plan[goal_index].x - robot_pose.x;
-        double to_goal_y = plan[goal_index].y - robot_pose.y;
-        double dot = to_goal_x * std::cos(goal_yaw) + to_goal_y * std::sin(goal_yaw);
-        if (dot >= 0.0)
+        double curvature = std::fabs(angles::shortest_angular_distance(from.theta_out, to.theta_in)) / length;
+        if (curvature < 1e-3)
         {
-          selected_fallback = true;
-          break;
+          continue;
         }
-        continue;
-      }
-
-      if (!enforce_forward_dot_ || goal_index == last_valid_index)
-      {
-        selected_fallback = true;
-        break;
+        double limit = curve_rotation_ / curvature;
+        speed = std::min(speed, std::sqrt(limit * limit + 2.0 * decel_ * ahead));
       }
     }
-
-    if (!selected_fallback)
+    desired_speed_ = speed_direction_ * speed;
+    desired_rotation_ = 0.0;
+    if (have_stop)
     {
-      return false;
+      target_ = makePose(vertices_[stop_index].x, vertices_[stop_index].y, vertices_[stop_index].theta_in);
     }
-
-    if (has_next_articulation && goal_index >= next_articulation_index)
+    else
     {
-      goal_index = next_articulation_index;
-      goal_yaw = next_articulation_yaw;
-      has_forward_direction = next_articulation_has_forward;
-      has_next_articulation = false;
-      forced_skipped_articulation = true;
-      ROS_DEBUG_NAMED("PathFollowerCritic", "Fallback switching to pending articulation index %u.", goal_index);
+      target_ = makePose(vertices_.back().x, vertices_.back().y, vertices_.back().theta_in);
     }
-
-    if (goal_index > last_progress_index_)
+    // Score deviations against the path from just behind the robot up to the next stop point. Segments before a
+    // passed stop point are excluded: after a reversal or U-turn they overlap the ones ahead with opposite heading.
+    window_first_ = robot_.segment > 0 ? robot_.segment - 1 : 0;
+    if (passed_valid)
     {
-      unsigned int articulation_index = 0;
-      double articulation_yaw = goal_yaw;
-      bool articulation_has_forward = has_forward_direction;
-      unsigned int articulation_start_index = articulationSearchStart(search_start_index);
-      if (articulation_start_index <= goal_index &&
-          findNextArticulation(plan, articulation_start_index, goal_index, last_valid_index, articulation_index,
-                               articulation_yaw, articulation_has_forward))
-      {
-        goal_index = articulation_index;
-        goal_yaw = articulation_yaw;
-        has_forward_direction = articulation_has_forward;
-      }
+      window_first_ = std::max(window_first_, passed_index);
     }
+    window_last_ = have_stop && stop_index > 0 ? stop_index - 1 : (num_segments > 0 ? num_segments - 1 : 0);
+    window_last_ = std::max(window_last_, window_first_);
   }
-
-  bool pending_articulation = false;
-  if (last_progress_index_ < goal_index)
-  {
-    pending_articulation =
-        std::find(articulation_indices.begin(), articulation_indices.end(), goal_index) != articulation_indices.end();
-  }
-
-  // Only consider snapping to the final goal yaw when we have already selected the last path index as goal.
-  // Otherwise, keep following the path even if the final goal is within tolerance.
-  if (!pending_articulation && final_goal_xy_tolerance_ >= 0.0 && final_goal_in_plan_window &&
-      plan_last_index <= last_valid_index && goal_index == plan_last_index)
-  {
-    double final_dx = plan[plan_last_index].x - plan[goal_index].x;
-    double final_dy = plan[plan_last_index].y - plan[goal_index].y;
-    double final_distance = hypot(final_dx, final_dy);
-    if (final_distance <= final_goal_xy_tolerance_)
-    {
-      goal_index = plan_last_index;
-      goal_yaw = nearestPlanOrientation(plan[plan_last_index]);
-      has_forward_direction = false;
-    }
-  }
-
-  ROS_ASSERT(goal_index <= last_valid_index);
-
-  worldToGridBounded(info, plan[goal_index].x, plan[goal_index].y, x, y);
-  geometry_msgs::Pose2D goal_pose = plan[goal_index];
-  double goal_plan_yaw = nearestPlanOrientation(goal_pose);
-  desired_angle = goal_plan_yaw;
-  goal_yaw = goal_plan_yaw;
-
-  bool same_as_held = false;
-  if (holding_goal_)
-  {
-    double position_diff_x = plan[goal_index].x - held_goal_pose_.x;
-    double position_diff_y = plan[goal_index].y - held_goal_pose_.y;
-    double yaw_diff = angles::shortest_angular_distance(goal_yaw, held_goal_pose_.theta);
-    same_as_held = (fabs(position_diff_x) <= hold_position_epsilon_) &&
-                   (fabs(position_diff_y) <= hold_position_epsilon_) && (fabs(yaw_diff) <= hold_yaw_epsilon_);
-  }
-
-  if (!same_as_held)
-  {
-    held_goal_pose_ = goal_pose;
-    held_goal_pose_.theta = goal_plan_yaw;
-    held_goal_index_ = goal_index;
-  }
-  else
-  {
-    held_goal_pose_.x = plan[goal_index].x;
-    held_goal_pose_.y = plan[goal_index].y;
-    held_goal_pose_.theta = goal_plan_yaw;
-  }
-  holding_goal_ = true;
 
   ROS_DEBUG_NAMED("PathFollowerCritic",
-                  "Selected goal index %u (x: %.3f, y: %.3f, yaw: %.3f rad). last_progress_index_: %u", goal_index,
-                  plan[goal_index].x, plan[goal_index].y, goal_yaw, last_progress_index_);
-
-  publishIntermediateGoal(held_goal_pose_, held_goal_pose_.theta);
+                  "robot (%.3f, %.3f, %.2f) on segment %zu t=%.2f s=%.3f dist=%.3f | stop %s%zu d=%.3f | turning=%d "
+                  "v_des=%.2f w_des=%.2f | passed=%s%zu | plan %zu poses, %zu vertices",
+                  pose.x, pose.y, pose.theta, robot_.segment, robot_.t, robot_.s, robot_.distance,
+                  have_stop ? "" : "none ", stop_index, distance_to_stop, turning_, desired_speed_, desired_rotation_,
+                  passed_valid ? "" : "none ", passed_index, global_plan.poses.size(), vertices_.size());
+  publishTarget(global_plan);
+  prepared_ = true;
   return true;
 }
 
-unsigned int PathFollowerCritic::getGoalIndex(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int start_index,
-                                              unsigned int last_valid_index, bool plan_tail_is_final_goal,
-                                              double& desired_angle, bool& has_forward_direction) const
+double PathFollowerCritic::scoreTrajectory(const dwb_msgs::Trajectory2D& traj)
 {
-  if (plan.empty())
+  if (!prepared_ || traj.poses.empty())
   {
-    desired_angle = 0.0;
-    has_forward_direction = false;
-    return 0;
+    throw nav_core2::IllegalTrajectoryException(name_, "No prepared path or empty trajectory.");
   }
-
-  const double epsilon = 1e-9;
-  unsigned int clamped_start = std::min(start_index, static_cast<unsigned int>(plan.size() - 1));
-  unsigned int clamped_last = std::min(last_valid_index, static_cast<unsigned int>(plan.size() - 1));
-  unsigned int max_spacing = intermediate_goal_spacing_;
-  bool spacing_limit_enabled = true;
-  unsigned int loop_last = clamped_last;
-  if (max_spacing >= std::numeric_limits<unsigned int>::max())
+  const nav_grid::NavGridInfo& info = costmap_->getInfo();
+  for (const auto& pose : traj.poses)
   {
-    spacing_limit_enabled = false;
-  }
-  else
-  {
-    unsigned int allowed_offset = max_spacing + 1u;
-    if (allowed_offset == 0u)
+    // Center point check only; ObstacleFootprint does the full footprint.
+    unsigned int cell_x, cell_y;
+    if (worldToGridBounded(info, pose.x, pose.y, cell_x, cell_y) &&
+        (*costmap_)(cell_x, cell_y) == nav_core2::Costmap::LETHAL_OBSTACLE)
     {
-      spacing_limit_enabled = false;
-    }
-    else if (clamped_start <= std::numeric_limits<unsigned int>::max() - allowed_offset)
-    {
-      unsigned int spacing_limit_index = clamped_start + allowed_offset;
-      if (spacing_limit_index < loop_last)
-      {
-        loop_last = spacing_limit_index;
-      }
-    }
-  }
-  const double orientation_progress_epsilon = 1e-3;
-
-  if (clamped_start >= clamped_last)
-  {
-    desired_angle = plan[clamped_start].theta;
-    has_forward_direction = hasForwardProgress(plan, clamped_start);
-    if (plan_tail_is_final_goal && clamped_start == plan.size() - 1)
-    {
-      has_forward_direction = false;
-    }
-    return clamped_start;
-  }
-
-  if (spacing_limit_enabled)
-  {
-    unsigned int articulation_index = 0u;
-    double articulation_yaw = 0.0;
-    bool articulation_has_forward = false;
-    if (findNextArticulation(plan, clamped_start, clamped_last, last_valid_index, articulation_index, articulation_yaw,
-                             articulation_has_forward) &&
-        articulation_index > clamped_start)
-    {
-      loop_last = std::min(loop_last, articulation_index);
+      throw nav_core2::IllegalTrajectoryException(name_, "Trajectory hits an obstacle.");
     }
   }
 
-  unsigned int goal_index = clamped_start;
-  double base_angle = 0.0;
-  bool base_angle_set = false;
-  double previous_segment_angle = 0.0;
-  bool previous_segment_angle_set = false;
-  unsigned int previous_segment_end_index = clamped_start;
+  const geometry_msgs::Pose2D& end = traj.poses.back();
+  double speed_error = (traj.velocity.x - desired_speed_) / max_speed_;
+  double score = speed_scale_ * speed_error * speed_error;
 
-  unsigned int loop_end = spacing_limit_enabled ? std::min(loop_last, clamped_last) : clamped_last;
-  for (unsigned int i = clamped_start + 1; i <= loop_end; ++i)
+  if (turning_)
   {
-    double direction_x = plan[i].x - plan[i - 1].x;
-    double direction_y = plan[i].y - plan[i - 1].y;
-    double length = hypot(direction_x, direction_y);
-    if (length < epsilon)
-    {
-      double orientation_delta = fabs(angles::shortest_angular_distance(plan[goal_index].theta, plan[i].theta));
-      if (orientation_delta > orientation_progress_epsilon)
-      {
-        goal_index = i;
-        break;
-      }
-
-      goal_index = i;
-      continue;
-    }
-
-    double current_angle = atan2(direction_y, direction_x);
-
-    if (!base_angle_set)
-    {
-      base_angle = current_angle;
-      base_angle_set = true;
-    }
-
-    if (previous_segment_angle_set)
-    {
-      double articulation_angle = fabs(angles::shortest_angular_distance(previous_segment_angle, current_angle));
-      if (articulation_angle >= articulation_angle_threshold_)
-      {
-        goal_index = previous_segment_end_index;
-        break;
-      }
-    }
-
-    double deviation = fabs(angles::shortest_angular_distance(base_angle, current_angle));
-    if (deviation > angle_threshold_)
-    {
-      break;
-    }
-
-    goal_index = i;
-    previous_segment_angle = current_angle;
-    previous_segment_end_index = i;
-    previous_segment_angle_set = true;
+    double rotation_error = (traj.velocity.theta - desired_rotation_) / max_rotation_;
+    score += rotation_scale_ * rotation_error * rotation_error;
+    // Hold (or creep onto) the stop point while turning.
+    score += path_distance_scale_ * std::hypot(end.x - target_.x, end.y - target_.y) / info.resolution;
+    return score;
   }
 
-  if (goal_index == clamped_start && loop_end > clamped_start)
+  // Lateral error: where the trajectory ends up plus any excursion beyond the initial offset (corner cutting).
+  Projection first = project(traj.poses.front().x, traj.poses.front().y, window_first_, window_last_, true);
+  Projection last = first;
+  double max_deviation = first.distance;
+  for (size_t i = 1; i < traj.poses.size(); ++i)
   {
-    goal_index = loop_end;
+    last = project(traj.poses[i].x, traj.poses[i].y, window_first_, window_last_, true);
+    max_deviation = std::max(max_deviation, last.distance);
   }
+  double lateral = last.distance + std::max(0.0, max_deviation - first.distance);
+  score += path_distance_scale_ * lateral / info.resolution;
 
-  desired_angle = plan[goal_index].theta;
-  has_forward_direction = hasForwardProgress(plan, goal_index);
-
-  if (plan_tail_is_final_goal && goal_index == plan.size() - 1)
-  {
-    has_forward_direction = false;
-  }
-
-  return goal_index;
+  double heading_error = angles::shortest_angular_distance(end.theta, pathHeading(last));
+  score += heading_scale_ * heading_error * heading_error;
+  return score;
 }
 
-bool PathFollowerCritic::findNextArticulation(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int start_index,
-                                              unsigned int end_index, unsigned int last_valid_index,
-                                              unsigned int& articulation_index, double& articulation_yaw,
-                                              bool& has_forward_direction) const
+void PathFollowerCritic::publishTarget(const nav_2d_msgs::Path2D& plan) const
 {
-  const double epsilon = 1e-9;
-  articulation_index = 0;
-  articulation_yaw = 0.0;
-  has_forward_direction = false;
-
-  if (plan.size() < 2)
+  if (!intermediate_goal_pub_ || intermediate_goal_pub_.getNumSubscribers() == 0)
   {
-    return false;
+    return;
   }
-
-  unsigned int clamped_end = std::min(end_index, static_cast<unsigned int>(plan.size() - 1));
-  clamped_end = std::min(clamped_end, last_valid_index);
-  if (clamped_end < 1)
-  {
-    return false;
-  }
-
-  unsigned int scan_start = std::max(start_index, 1u);
-  if (scan_start > clamped_end)
-  {
-    return false;
-  }
-
-  double previous_segment_angle = 0.0;
-  bool previous_segment_angle_set = false;
-  unsigned int previous_segment_end_index = 0;
-
-  for (unsigned int i = scan_start; i <= clamped_end; ++i)
-  {
-    double direction_x = plan[i].x - plan[i - 1].x;
-    double direction_y = plan[i].y - plan[i - 1].y;
-    double length = hypot(direction_x, direction_y);
-    if (length < epsilon)
-    {
-      continue;
-    }
-
-    double current_angle = atan2(direction_y, direction_x);
-
-    if (previous_segment_angle_set)
-    {
-      double articulation_angle = fabs(angles::shortest_angular_distance(previous_segment_angle, current_angle));
-      if (articulation_angle >= articulation_angle_threshold_)
-      {
-        articulation_index = previous_segment_end_index;
-        articulation_yaw = plan[articulation_index].theta;
-        has_forward_direction = hasForwardProgress(plan, articulation_index);
-        return true;
-      }
-    }
-
-    previous_segment_angle = current_angle;
-    previous_segment_angle_set = true;
-    previous_segment_end_index = i;
-  }
-
-  return false;
-}
-
-bool PathFollowerCritic::hasForwardProgress(const std::vector<geometry_msgs::Pose2D>& plan, unsigned int index) const
-{
-  const double epsilon = 1e-9;
-  if (plan.empty() || index >= plan.size())
-  {
-    return false;
-  }
-
-  for (unsigned int i = index + 1; i < plan.size(); ++i)
-  {
-    double dx = plan[i].x - plan[index].x;
-    double dy = plan[i].y - plan[index].y;
-    double length = hypot(dx, dy);
-    if (length >= epsilon)
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool PathFollowerCritic::isPoseReached(const geometry_msgs::Pose2D& robot_pose, const geometry_msgs::Pose2D& goal_pose,
-                                       double goal_yaw, double xy_tolerance, double yaw_tolerance) const
-{
-  double distance = nav_2d_utils::poseDistance(goal_pose, robot_pose);
-  double yaw_error = fabs(angles::shortest_angular_distance(robot_pose.theta, goal_yaw));
-
-  return distance < xy_tolerance && yaw_error < yaw_tolerance;
-}
-
-bool PathFollowerCritic::isGoalReached(const geometry_msgs::Pose2D& robot_pose, const geometry_msgs::Pose2D& goal_pose,
-                                       double goal_yaw) const
-{
-  return isPoseReached(robot_pose, goal_pose, goal_yaw, xy_local_goal_tolerance_, yaw_local_goal_tolerance_);
+  geometry_msgs::PoseStamped msg;
+  msg.header = plan.header;
+  msg.header.stamp = ros::Time::now();
+  msg.pose.position.x = target_.x;
+  msg.pose.position.y = target_.y;
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, target_.theta);
+  msg.pose.orientation.x = q.x();
+  msg.pose.orientation.y = q.y();
+  msg.pose.orientation.z = q.z();
+  msg.pose.orientation.w = q.w();
+  intermediate_goal_pub_.publish(msg);
 }
 
 }  // namespace mir_dwb_critics
