@@ -55,6 +55,9 @@
     <param name="default_vw_min" value="-1.5" />
   </node>
 
+  <!-- robot_state like the real MiR publishes it (Ready; set_docked service to simulate charging) -->
+  <node name="fake_mir_robot_state" pkg="mir_gazebo" type="fake_mir_robot_state.py" output="screen" />
+
   <!-- create combined scan topic (like on real MiR) -->
   <node pkg="topic_tools" type="relay" name="b_scan_relay" args="b_scan scan"/>
   <node pkg="topic_tools" type="relay" name="f_scan_relay" args="f_scan scan"/>

@@ -36,6 +36,7 @@ import sys
 from collections.abc import Iterable
 
 from mir_driver import rosbridge
+from mir_driver.charging_guard import CLEAR, SOURCE_TOPICS, ChargingGuard, parse_sources
 from rospy_message_converter import message_converter
 
 from actionlib import SimpleActionClient
@@ -209,7 +210,7 @@ def _remove_tf_prefix_dict_filter(msg_dict):
 # topics we want to publish to ROS (and subscribe to from the MiR)
 PUB_TOPICS = [
     # TopicConfig('LightCtrl/bms_data', mir_msgs.msg.BMSData),
-    # TopicConfig('LightCtrl/charging_state', mir_msgs.msg.ChargingState),
+    TopicConfig('LightCtrl/charging_state', mir_msgs.msg.ChargingState),
     TopicConfig('LightCtrl/us_list', sensor_msgs.msg.Range),
     # TopicConfig('MC/battery_currents', mir_msgs.msg.BatteryCurrents),
     # TopicConfig('MC/battery_voltage', std_msgs.msg.Float64),
@@ -405,9 +406,11 @@ class PublisherWrapper(rospy.SubscribeListener):
 
 
 class SubscriberWrapper(object):
-    def __init__(self, topic_config, robot):
+    def __init__(self, topic_config, robot, allow=None):
         self.topic_config = topic_config
         self.robot = robot
+        # allow(msg) -> bool: False drops the message instead of forwarding it to the MiR
+        self.allow = allow
         # Use topic_config.topic directly here. If it does not have a leading slash, it will use the private namespace.
         self.sub = rospy.Subscriber(
             name=topic_config.topic, data_class=topic_config.topic_type, callback=self.callback, queue_size=10
@@ -417,6 +420,11 @@ class SubscriberWrapper(object):
         )
 
     def callback(self, msg):
+        if self.allow is not None and not self.allow(msg):
+            return
+        self.forward(msg)
+
+    def forward(self, msg):
         msg_dict = message_converter.convert_ros_message_to_dictionary(msg)
         msg_dict = _remove_tf_prefix_dict_filter(msg_dict)
         if self.topic_config.dict_filter is not None:
@@ -465,8 +473,12 @@ class MiRBridge(object):
             if absolute_topic not in published_topics:
                 rospy.logwarn("[%s] topic '%s' is not published by the MiR!", rospy.get_name(), pub_topic.topic)
 
+        self._wrappers = {}
+        self._setup_charging_guard(published_topics)
+        allow = {'cmd_vel': self._allow_cmd_vel, 'move_base/goal': self._allow_move_base_goal, 'mir_cmd': self._allow_mir_cmd}
+
         for sub_topic in SUB_TOPICS:
-            SubscriberWrapper(sub_topic, self.robot)
+            self._wrappers[sub_topic.topic] = SubscriberWrapper(sub_topic, self.robot, allow.get(sub_topic.topic))
             absolute_topic = '/' + sub_topic.topic.lstrip('/')  # ensure exactly 1 leading slash for MiR comm
             if absolute_topic not in subscribed_topics:
                 rospy.logwarn("[%s] topic '%s' is not yet subscribed to by the MiR!", rospy.get_name(), sub_topic.topic)
@@ -475,6 +487,110 @@ class MiRBridge(object):
         # This workaround converts it into an action. Check https://github.com/DFKI-NI/mir_robot/issues/60 for details.
         self._move_base_client = SimpleActionClient('move_base', move_base_msgs.msg.MoveBaseAction)
         rospy.Subscriber("move_base_simple/goal", geometry_msgs.msg.PoseStamped, self._move_base_simple_goal_callback)
+
+    def _setup_charging_guard(self, published_topics):
+        """Refuse base motion while the MiR charges or its charging state is unknown (~block_nav_while_charging).
+
+        While blocked: move_base goals get a local ABORTED result with the reason and are not forwarded, cmd_vel and
+        mir_cmd (opaque MiR commands, treated as motion-capable) are dropped; a cancel and a zero twist always pass.
+        On the transition into blocked the bridge sends the MiR a cancel of all goals and one zero twist, so a goal
+        forwarded before keeps no running. The flag, ~charging_sources (the required sources, default robot_state) and
+        ~charging_state_timeout are read again every second, so they switch at runtime (rosparam set) without a
+        restart. Outside this block: whatever moves the MiR without this bridge (its web interface, its joystick).
+        """
+        self._charging_guard = None
+        self._blocked = False
+        self._block_nav_while_charging = False
+        self._published_topics = set(published_topics)
+        self._nav_result_pub = rospy.Publisher('move_base/result', move_base_msgs.msg.MoveBaseActionResult, queue_size=10)
+        self._guard_ticks = 0
+        self._read_block_flag()
+        rospy.Timer(rospy.Duration(0.2), self._check_charging_guard)
+
+    def _read_block_flag(self):
+        try:
+            enabled = bool(rospy.get_param('~block_nav_while_charging', False))
+            required = parse_sources(rospy.get_param('~charging_sources', 'robot_state'))
+            timeout = float(rospy.get_param('~charging_state_timeout', 5.0))
+        except ValueError as exc:
+            rospy.logerr_throttle(10.0, '[%s] charging guard: %s; keeping the last settings' % (rospy.get_name(), exc))
+            return
+        except Exception:  # master gone: keep the last values
+            return
+        if enabled and self._charging_guard is None:
+            self._charging_guard = ChargingGuard(timeout, required)
+            # our own subscriptions on the MiR side, independent of whether any ROS node listens to these topics
+            self.robot.subscribe(topic='/robot_state', callback=self._charging_guard.on_robot_state)
+            if '/LightCtrl/charging_state' in self._published_topics:
+                self.robot.subscribe(topic='/LightCtrl/charging_state', callback=self._charging_guard.on_charging_state)
+        if self._charging_guard is not None:
+            guard = self._charging_guard
+            if (required, timeout) != (guard.required, guard.timeout):
+                rospy.loginfo('[%s] charging guard: required sources %s, stale after %.1f s', rospy.get_name(),
+                              ', '.join(required), timeout)
+            guard.required, guard.timeout = required, timeout
+            for source in required:
+                if '/' + SOURCE_TOPICS[source] not in self._published_topics:
+                    guard.mark_unavailable(source, 'the MiR does not publish %s' % SOURCE_TOPICS[source])
+        if enabled != self._block_nav_while_charging:
+            rospy.loginfo("[%s] block_nav_while_charging %s", rospy.get_name(), 'on' if enabled else 'off')
+        self._block_nav_while_charging = enabled
+
+    def _check_charging_guard(self, _event=None):
+        self._guard_ticks += 1
+        if self._guard_ticks % 5 == 1:
+            self._read_block_flag()
+        guard = self._charging_guard
+        if guard is not None and not self.robot.is_connected() and not guard.is_reset():
+            guard.reset('the connection to the MiR was lost')
+        reason = self._nav_refusal()
+        blocked = reason is not None
+        if blocked and not self._blocked:
+            rospy.logwarn('[%s] %s: cancelling all MiR goals and stopping the base', rospy.get_name(), reason)
+            self._stop_mir()
+        elif not blocked and self._blocked:
+            rospy.loginfo('[%s] charging guard clear: base motion allowed again', rospy.get_name())
+        self._blocked = blocked
+
+    def _stop_mir(self):
+        """Cancel every MiR goal and send one zero twist (both pass the gate)."""
+        self._wrappers['move_base/cancel'].forward(actionlib_msgs.msg.GoalID())  # empty id = cancel all goals
+        self._wrappers['cmd_vel'].forward(geometry_msgs.msg.Twist())
+
+    def _nav_refusal(self):
+        if not self._block_nav_while_charging or self._charging_guard is None:
+            return None
+        return self._charging_guard.refusal()
+
+    def _allow_move_base_goal(self, msg):
+        reason = self._nav_refusal()
+        if reason is None:
+            return True
+        rospy.logwarn("[%s] %s (move_base goal '%s' not forwarded to the MiR)", rospy.get_name(), reason, msg.goal_id.id)
+        result = move_base_msgs.msg.MoveBaseActionResult()
+        result.header.stamp = rospy.Time.now()
+        result.status.goal_id = msg.goal_id
+        result.status.status = actionlib_msgs.msg.GoalStatus.ABORTED
+        result.status.text = reason
+        self._nav_result_pub.publish(result)
+        return False
+
+    def _allow_cmd_vel(self, msg):
+        twist = getattr(msg, 'twist', msg)  # Twist or TwistStamped
+        if not any((twist.linear.x, twist.linear.y, twist.linear.z, twist.angular.x, twist.angular.y, twist.angular.z)):
+            return True  # a stop command is always forwarded
+        reason = self._nav_refusal()
+        if reason is None:
+            return True
+        rospy.logwarn_throttle(5.0, '[%s] %s (cmd_vel dropped)' % (rospy.get_name(), reason))
+        return False
+
+    def _allow_mir_cmd(self, msg):
+        reason = self._nav_refusal()
+        if reason is None:
+            return True
+        rospy.logwarn("[%s] %s (mir_cmd '%s' dropped)", rospy.get_name(), reason, msg.data)
+        return False
 
     def get_topics(self):
         srv_response = self.robot.callService('/rosapi/topics', msg={})
