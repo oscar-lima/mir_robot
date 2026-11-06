@@ -7,6 +7,13 @@
 
   <arg name="disable_map" default="false" doc="Disable the map topic and map -> odom TF transform from the MiR" />
 
+  <arg name="block_nav_while_charging" default="false"
+       doc="Refuse move_base goals and drop cmd_vel while the MiR charges (Docked or charging relay on) or its charging state is unknown; switchable at runtime with rosparam set mir_bridge/block_nav_while_charging" />
+  <arg name="charging_sources" default="robot_state"
+       doc="Charging sources that must be fresh for base motion: robot_state, charging_relay (LightCtrl/charging_state) or both, comma separated; any fresh positive source blocks" />
+  <arg name="charging_state_timeout" default="5.0"
+       doc="Seconds without a message from a required charging source after which the charging state counts as unknown" />
+
   <param name="tf_prefix" type="string" value="$(arg tf_prefix)"/>
 
   <!-- URDF -->
@@ -43,6 +50,9 @@
     <node name="mir_bridge" pkg="mir_driver" type="mir_bridge.py" output="screen">
       <param name="hostname" value="$(arg mir_hostname)" />
       <param name="tf_prefix" value="$(arg tf_prefix)" />
+      <param name="block_nav_while_charging" value="$(arg block_nav_while_charging)" />
+      <param name="charging_sources" value="$(arg charging_sources)" />
+      <param name="charging_state_timeout" value="$(arg charging_state_timeout)" />
       <remap from="map" to="map_mir" />
       <remap from="map_metadata" to="map_metadata_mir" />
       <remap from="rosout" to="/rosout" />
@@ -63,6 +73,9 @@
     <node name="mir_bridge" pkg="mir_driver" type="mir_bridge.py" output="screen">
       <param name="hostname" value="$(arg mir_hostname)" />
       <param name="tf_prefix" value="$(arg tf_prefix)" />
+      <param name="block_nav_while_charging" value="$(arg block_nav_while_charging)" />
+      <param name="charging_sources" value="$(arg charging_sources)" />
+      <param name="charging_state_timeout" value="$(arg charging_state_timeout)" />
       <remap from="map" to="/map" />
       <remap from="map_metadata" to="/map_metadata" />
       <remap from="rosout" to="/rosout" />

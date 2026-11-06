@@ -14,6 +14,11 @@ catkin_package()
 ## Install ##
 #############
 
+catkin_install_python(PROGRAMS
+  nodes/fake_mir_robot_state.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # Mark other files for installation (e.g. launch and bag files, etc.)
 install(DIRECTORY
   config
